@@ -1,190 +1,705 @@
-"""환자 질문 추론 API (FastAPI).
 
-흐름
-  1. Streamlit 등이 POST /chat 으로 member_id 와 질문을 보낸다.
-  2. 이 서버가 Ollama(Gemma)에 질문과 툴 목록을 보낸다.
-  3. 모델이 툴 호출을 요청하면 이 서버가 대신 실행하고 결과를 모델에 돌려준다.
-  4. 모델이 최종 답을 쓰면 답만 돌려준다 (thinking 은 버린다).
-
-설정은 환경변수로 바꾼다.
-  OLLAMA_URL    기본 http://127.0.0.1:11435  (SSH 터널로 서버 Ollama에 연결)
-  LLM_MODEL     기본 gemma4:12b  (부담되면 E4B 등으로 교체)
-  LLM_NUM_CTX   기본 8192  (컨텍스트 길이. 크면 GPU 메모리를 많이 씀)
-  LLM_THINK     기본 비움(모델 기본값). true / false 로 생각 모드를 켜고 끔
-  DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD  PostgreSQL 접속 정보 (patient_tools.py 가 읽음)
-실행 (llm_app 폴더에서)
-  uvicorn main:app --port 8001
 """
+FITIF C파트 - Gemma 4 Tool Calling API
+
+역할:
+    사용자 질문을 Gemma 4에 전달하고,
+    모델이 요청한 도구를 Python에서 실행한 뒤,
+    조회 결과를 자연어로 설명하도록 한다.
+
+전체 처리 흐름:
+    1. 사용자가 POST /chat으로 질문 전송
+    2. Ollama의 Gemma 4 모델에 질문 전달
+    3. Gemma가 필요한 Tool 선택
+    4. Python에서 해당 Tool 실행
+    5. Tool 실행 결과를 Gemma에 전달
+    6. Gemma가 최종 한국어 답변 생성
+    7. FastAPI가 결과 반환
+
+현재 지원하는 도구:
+    get_patient_record:
+        기존 C파트 PostgreSQL 환자정보 조회
+
+    get_glucose_readings:
+        A파트 FastAPI를 이용한 과거 CGM 혈당 조회
+
+실행 환경:
+    5090 GPU 서버 (fitif@server301)
+
+실행 명령:
+    cd ~/FITIF-integration/llm_app
+    uvicorn main:app --host 127.0.0.1 --port 18002
+
+주의:
+    현재는 내부 통합 테스트용 API이다.
+    사용자 인증 및 접근 권한 확인이 구현되지 않았으므로
+    외부에 공개해서는 안 된다.
+"""
+
 import json
+import logging
 import os
 import time
+
 import httpx
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+# 기존 C파트 환자정보 조회 함수
 from patient_tools import get_patient_record
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11435")
-MODEL = os.environ.get("LLM_MODEL", "gemma4:12b")
-NUM_CTX = int(os.environ.get("LLM_NUM_CTX", "8192"))
-THINK = os.environ.get("LLM_THINK", "").strip().lower()  # "", "true", "false"
-MAX_STEPS = 4      # 툴 호출 왕복 최대 횟수
-TIMEOUT = 120      # Ollama 응답 대기(초)
+# A파트 FastAPI 연동 함수
+from glucose_api import fetch_glucose_from_api
 
-SYSTEM_PROMPT = """너는 환자의 복약과 건강 기록을 읽고 질문에 답하는 도우미다.
-지금 대화 중인 환자의 번호는 {member_id}번이다.
 
-규칙
-- 환자 기록이 필요하면 get_patient_record 툴로 조회한다. 기록에 없는 내용은 지어내지 말고 없다고 말한다.
-- 약은 제품명, 주성분, 함량, 1회 투여량, 하루 횟수, 기간을 함께 말한다.
-- 약 변화를 물으면 추가, 중단, 용량 변경을 말하고, 변화 없이 유지된 약이 몇 개인지(unchanged_count)도 함께 말한다.
-- 혈당은 값과 함께 측정 시점을 "N분 전"으로 반드시 말한다(minutes_ago 값 사용). 예) "15분 전에 측정한 혈당은 142mg/dL입니다." freshness 가 old 이면 "45분 전 값이라 지금과 다를 수 있습니다"처럼 시점이 지났음을 덧붙인다. unavailable 이면 "최근 혈당 기록이 없습니다"라고만 말하고 숫자를 추측하지 않는다.
-- 진단이나 처방 변경은 하지 않는다. 판단이 필요한 내용은 의사나 약사와 상담하라고 안내한다.
-- 한국어로 알기 쉽게 답한다. 길게 늘이지 말되, 위 규칙에서 말하라고 한 정보는 빠뜨리지 않는다."""
+# =========================================================
+# 1. 환경설정
+# =========================================================
 
-# TOOLS 는 Ollama 모델이 호출할 수 있는 함수 목록(매뉴판같은)이다. 모델이 요청하면 run_tool()에서 실행한다.
+# Ollama API 주소
+OLLAMA_URL = os.environ.get(
+    "OLLAMA_URL",
+    "http://127.0.0.1:11435"
+).rstrip("/")
+
+# 사용할 Gemma 모델
+MODEL = os.environ.get(
+    "LLM_MODEL",
+    "gemma4:12b"
+)
+
+# 모델이 사용할 최대 컨텍스트 길이
+NUM_CTX = int(
+    os.environ.get("LLM_NUM_CTX", "8192")
+)
+
+# Gemma Thinking 모드
+# true / false / 미설정
+THINK = os.environ.get(
+    "LLM_THINK",
+    ""
+).strip().lower()
+
+# Tool Calling 최대 왕복 횟수
+MAX_STEPS = 4
+
+# Ollama HTTP 요청 제한 시간(초)
+TIMEOUT = 120
+
+# 진단·처방 조회 과정의 직접 DB 접근을 허용할지 결정한다.
+# 현재는 기존 기능을 보존하기 위해 기본적으로 허용한다.
+ENABLE_PATIENT_RECORD_TOOL = True
+
+
+# =========================================================
+# 2. 로그 설정
+# =========================================================
+
+# 로그에는 Tool 이름과 실행 성공 여부만 남긴다.
+# 환자 개인정보와 혈당 데이터는 출력하지 않는다.
+logger = logging.getLogger("fitif.llm")
+
+
+# =========================================================
+# 3. Gemma 시스템 프롬프트
+# =========================================================
+
+SYSTEM_PROMPT = """
+너는 FITIF 헬스케어 서비스의 건강정보 안내 도우미다.
+
+현재 대화 중인 사용자 번호는 {member_id}번이다.
+
+[기본 규칙]
+- 사용자에게 한국어로 알기 쉽게 설명한다.
+- 조회하지 않은 의료정보를 추측해서 답변하지 않는다.
+- 의료진의 진단이나 처방을 임의로 변경하지 않는다.
+- 필요한 경우 의사 또는 약사와 상담하도록 안내한다.
+
+[혈당 조회 규칙]
+- 사용자가 혈당 기록을 질문하면 get_glucose_readings 도구를 사용한다.
+- 혈당 기록 조회를 위해 get_patient_record를 사용하지 않는다.
+- 혈당 결과에는 실제 측정 날짜와 시간, 혈당값을 포함한다.
+- 혈당 기록의 measured_at_kst 필드가 한국시간으로 변환된 정확한 시각이다.
+- 혈당 측정 시각을 직접 계산하거나 임의로 변경하지 않는다.
+- 각 혈당값과 해당 기록의 measured_at_kst를 정확히 일대일로 대응하여 설명한다.
+- 혈당 기록은 최신 측정 시각부터 순서대로 설명한다.
+- 과거 기록을 현재 혈당이라고 설명하지 않는다.
+- 오래된 기록을 '방금', '15분 전'처럼 표현하지 않는다.
+- 조회 결과가 없거나 오류가 발생하면 숫자를 추측하지 않는다.
+- 도구에서 반환된 값만 사용한다.
+
+[진단 및 처방 조회 규칙]
+- 진단, 처방, 약물 변경에 관한 질문에는 get_patient_record를 사용한다.
+- 약물 정보를 설명할 때는 확인 가능한 제품명, 성분명,
+  함량, 1회 복용량, 하루 횟수, 기간을 전달한다.
+- 약물 변경 질문에는 추가, 중단, 용량 변경을 구분한다.
+- 확인되지 않은 정보는 임의로 생성하지 않는다.
+
+[답변 작성 규칙]
+- 도구 실행 결과가 제공되면 이를 바탕으로 최종 답변을 작성한다.
+- 질문과 관련된 정보만 간결하게 전달한다.
+- 과거 데이터는 반드시 과거 기록임을 명시한다.
+"""
+
+
+# =========================================================
+# 4. Tool 정의
+# =========================================================
+
+# Gemma가 사용할 수 있는 함수 목록이다.
+#
+# 여기서 도구를 정의하는 것만으로
+# 실제 Python 함수가 실행되는 것은 아니다.
+#
+# 모델이 도구 호출을 요청하면
+# 아래 run_tool()에서 실제 실행한다.
+
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_patient_record",
-            "description": "환자의 진단, 처방(약), 약 변화, 최근 혈당을 한 번에 조회한다",
+            "name": "get_glucose_readings",
+            "description": (
+                "A파트 FastAPI를 통해 사용자의 "
+                "과거 CGM 혈당 측정 기록 3건을 조회한다. "
+                "혈당값과 정확한 측정 시각을 반환한다."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "member_id": {"type": "integer", "description": "환자 번호"},
-                }, #"parameters" 내용은 jsonschema 표준 형식
-                "required": ["member_id"],
-            },
-        },
+                    "member_id": {
+                        "type": "integer",
+                        "description": "조회할 사용자 번호"
+                    }
+                },
+                "required": ["member_id"]
+            }
+        }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_patient_record",
+            "description": (
+                "환자의 진단, 처방 약물, "
+                "약물 변경 정보를 조회한다. "
+                "혈당 기록만 묻는 질문에는 사용하지 않는다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "member_id": {
+                        "type": "integer",
+                        "description": "조회할 사용자 번호"
+                    }
+                },
+                "required": ["member_id"]
+            }
+        }
+    }
 ]
 
-app = FastAPI(title="FITIF LLM 추론 API")
 
-#서버 API의 입구
+# =========================================================
+# 5. FastAPI 애플리케이션
+# =========================================================
+
+app = FastAPI(
+    title="FITIF LLM 추론 API",
+    description="Gemma 4 기반 의료정보 Tool Calling API",
+    version="0.2.0"
+)
+
+
+# =========================================================
+# 6. 요청 및 응답 데이터 형식
+# =========================================================
+
 class ChatRequest(BaseModel):
-    member_id: int = Field(..., description="환자 번호")
-    message: str = Field(..., min_length=1, description="사용자 질문")
+    """
+    사용자가 /chat에 전달하는 요청 형식.
 
-#서버 API의 출구 돌아온 답변
+    member_id:
+        조회할 사용자 번호.
+
+    message:
+        사용자의 자연어 질문.
+    """
+
+    member_id: int = Field(
+        ...,
+        ge=1,
+        description="환자 번호"
+    )
+
+    message: str = Field(
+        ...,
+        min_length=1,
+        description="사용자 질문"
+    )
+
+
 class ChatResponse(BaseModel):
+    """
+    /chat API 응답 형식.
+
+    answer:
+        Gemma의 자연어 답변.
+
+    tool_calls:
+        실행한 Tool의 이름 및 상태 기록.
+
+    model:
+        사용한 LLM 모델.
+
+    elapsed_ms:
+        전체 처리 시간(ms).
+    """
+
     answer: str
     tool_calls: list
     model: str
     elapsed_ms: int
 
 
-def run_tool(name: str, member_id: int) -> dict:
-    """모델이 요청한 툴을 실행한다.
+# =========================================================
+# 7. 실제 Tool 실행 함수
+# =========================================================
 
-    member_id 는 모델이 넘긴 값을 쓰지 않고 요청에 들어온 값으로 고정한다.
-    모델이 다른 환자 번호를 넣어도 다른 사람 기록이 조회되지 않게 하려는 것이다.
+def run_tool(name: str, member_id: int) -> dict:
     """
+    Gemma가 요청한 도구를 실제 실행한다.
+
+    매개변수:
+        name:
+            실행할 도구 이름.
+
+        member_id:
+            요청에서 받은 사용자 번호.
+
+    보안:
+        LLM이 만들어 낸 member_id를 사용하지 않는다.
+
+        단, 현재 ChatRequest의 member_id 자체는
+        인증된 사용자 ID가 아니므로,
+        운영 환경에서는 인증·인가가 반드시 필요하다.
+    """
+
+    # ---------------------------------------------
+    # A파트 FastAPI 혈당 조회
+    # ---------------------------------------------
+
+    if name == "get_glucose_readings":
+
+        try:
+            # 별도 작성된 glucose_api.py 호출
+            # 5090 → SSH 터널 → 3060 FastAPI
+            result = fetch_glucose_from_api(
+                member_id=member_id,
+                limit=3
+            )
+
+            return result
+
+        except (ValueError, RuntimeError):
+            logger.warning(
+                "glucose API tool failed"
+            )
+
+            return {
+                "status": "error",
+                "message": "혈당 조회 서비스에 연결할 수 없습니다."
+            }
+
+    # ---------------------------------------------
+    # 기존 C파트 환자정보 조회
+    # ---------------------------------------------
+
     if name == "get_patient_record":
+
+        if not ENABLE_PATIENT_RECORD_TOOL:
+            return {
+                "status": "error",
+                "message": "환자정보 조회 기능을 사용할 수 없습니다."
+            }
+
         try:
             return get_patient_record(member_id)
-        except ValueError as e:
-            return {"status": "error", "message": str(e)}
-    return {"status": "error", "message": f"알 수 없는 툴: {name}"}
+
+        except ValueError:
+            logger.warning(
+                "patient record tool failed"
+            )
+
+            return {
+                "status": "error",
+                "message": "환자정보 조회에 실패했습니다."
+            }
+
+    # ---------------------------------------------
+    # 알 수 없는 도구
+    # ---------------------------------------------
+
+    return {
+        "status": "error",
+        "message": "지원하지 않는 도구입니다."
+    }
 
 
-def call_ollama(client: httpx.Client, messages: list) -> dict:
+# =========================================================
+# 8. Ollama API 호출 함수
+# =========================================================
+
+def call_ollama(
+    client: httpx.Client,
+    messages: list,
+    enable_tools: bool = True
+) -> dict:
+    """
+    Ollama의 Gemma 모델에 대화 내용을 전달한다.
+
+    매개변수:
+        client:
+            HTTP 연결을 관리하는 httpx 객체.
+
+        messages:
+            시스템 프롬프트, 사용자 질문,
+            Tool 호출 기록 등이 들어 있는 대화 목록.
+
+        enable_tools:
+            True:
+                Gemma에게 Tool 목록을 전달한다.
+
+            False:
+                Tool 목록을 전달하지 않는다.
+                조회가 끝났으므로 최종 답변 작성을 요청한다.
+
+    반환값:
+        Ollama 응답의 message 딕셔너리.
+    """
+
     payload = {
         "model": MODEL,
         "stream": False,
         "messages": messages,
-        "tools": TOOLS,
-        "options": {"num_ctx": NUM_CTX},
+        "options": {
+            "num_ctx": NUM_CTX
+        }
     }
+
+    # 초기 질문 단계에서만 Tool 정의를 전달한다.
+    if enable_tools:
+        payload["tools"] = TOOLS
+
+    # Thinking 설정이 명시된 경우 적용한다.
     if THINK in ("true", "false"):
         payload["think"] = THINK == "true"
+
     try:
-        r = client.post(f"{OLLAMA_URL}/api/chat", json=payload) #ollama가 정한 주소
-        r.raise_for_status()
-    except httpx.ConnectError:
-        raise HTTPException(502, f"Ollama에 연결할 수 없음: {OLLAMA_URL} (SSH 터널과 서버 Ollama 확인)")
-    except httpx.TimeoutException:
-        raise HTTPException(504, "Ollama 응답 시간 초과")
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(502, f"Ollama 오류: {e.response.text[:300]}")
-    return r.json()["message"]
+        response = client.post(
+            f"{OLLAMA_URL}/api/chat",
+            json=payload
+        )
 
-# r.json()["message"] 의 모양 
+        response.raise_for_status()
 
-# r.json() = {
-#     "model": "gemma4:12b",
-#     "message": {                                              ← call_ollama가 이 칸만 꺼내 돌려줌 (chat에서는 msg)
-#         "role": "assistant",
-#         "content": "",
-#         "tool_calls": [                                        ← 이 목록이 requested
-#             {"function": {"name": "get_patient_record",
-#                           "arguments": {"member_id": 1}}}
-#         ],
-#     },
-#     ... 그 밖의 칸들 (버전에 따라 다름)
-# }
-# Ollama의 /api/chat 응답에는 message 외에 
-# 모델 이름, 생성 시각, 완료 여부, 걸린 시간, 처리한 토큰 수 같은 칸들이 보통 들어 있다. 
-# 다만 정확한 칸 이름과 구성은 버전에 따라 다르다
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="Gemma 모델 응답 시간이 초과되었습니다."
+        ) from exc
 
-@app.get("/health")     #우리 서버 /health 로 접속
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "Ollama HTTP request failed: %s",
+            type(exc).__name__
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail="Gemma 모델 서버와 통신하지 못했습니다."
+        ) from exc
+
+    # Ollama 응답을 JSON으로 변환한다.
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Ollama 응답이 올바른 JSON 형식이 아닙니다."
+        ) from exc
+
+    message = data.get("message")
+
+    if not isinstance(message, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Ollama 응답에 message가 없습니다."
+        )
+
+    return message
+
+
+# =========================================================
+# 9. 서버 상태 확인 API
+# =========================================================
+
+@app.get("/health")
 def health():
-    """서버와 Ollama 연결, 모델 존재 여부를 확인한다."""
+    """
+    C파트 FastAPI와 Ollama 연결 상태를 확인한다.
+
+    주의:
+        Gemma 모델 존재 여부까지 확인하지만
+        A파트 DB 접근까지 검증하는 API는 아니다.
+    """
+
     try:
-        r = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=5)  #ollama에게 직접 물어봄
-        names = [m["name"] for m in r.json().get("models", [])] #예시 names = ["gemma4:12b", "다른모델:태그"]
-    except httpx.HTTPError:
-        return {"api": "ok", "ollama": "연결 안 됨", "ollama_url": OLLAMA_URL, "model": MODEL}
+        response = httpx.get(
+            f"{OLLAMA_URL}/api/tags",
+            timeout=5
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        names = [
+            item.get("name")
+            for item in data.get("models", [])
+        ]
+
+    except (httpx.HTTPError, ValueError):
+        return {
+            "api": "ok",
+            "ollama": "연결 안 됨",
+            "ollama_url": OLLAMA_URL,
+            "model": MODEL
+        }
+
     return {
         "api": "ok",
         "ollama": "ok",
         "ollama_url": OLLAMA_URL,
         "model": MODEL,
-        "model_available": MODEL in names,
+        "model_available": MODEL in names
     }
 
 
+# =========================================================
+# 10. 사용자 질문 처리 API
+# =========================================================
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    start = time.time()
+    """
+    사용자 질문을 Gemma에 전달하고 최종 답변을 반환한다.
+
+    처리 순서:
+        1. 질문과 시스템 프롬프트 생성
+        2. Gemma에 Tool 목록을 전달
+        3. 모델이 Tool을 선택하면 Python이 실행
+        4. Tool 결과를 대화 기록에 추가
+        5. 도구 목록 없이 Gemma에 최종 답변 요청
+        6. 자연어 답변 반환
+
+    이번 통합 테스트에서는 Tool을 한 번 선택한 뒤
+    그 결과로 최종 답변을 생성하도록 구성한다.
+    """
+
+    # 요청 시작 시간 기록
+    start = time.monotonic()
+
+    # ---------------------------------------------
+    # 10-1. 대화 기록 초기화
+    # ---------------------------------------------
+
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT.format(member_id=req.member_id)},
-        {"role": "user", "content": req.message}, #req에는 ChatRequest 양식에 맞게 검사를 통과한 요청이 들어온다
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT.format(
+                member_id=req.member_id
+            )
+        },
+        {
+            "role": "user",
+            "content": req.message
+        }
     ]
+
+    # 실제 호출한 Tool의 메타데이터
     calls = []
 
+    # HTTP 연결을 하나의 요청 처리 과정에서 재사용한다.
     with httpx.Client(timeout=TIMEOUT) as client:
-        for _ in range(MAX_STEPS):
-            msg = call_ollama(client, messages)
-            requested = msg.get("tool_calls") or []
 
-            if not requested:
-                return ChatResponse(
-                    answer=(msg.get("content") or "").strip(),
-                    tool_calls=calls,
-                    model=MODEL,
-                    elapsed_ms=int((time.time() - start) * 1000),
+        # -----------------------------------------
+        # 10-2. Gemma에게 Tool 선택 요청
+        # -----------------------------------------
+
+        msg = call_ollama(
+            client=client,
+            messages=messages,
+            enable_tools=True
+        )
+
+        requested = msg.get("tool_calls") or []
+
+        # -----------------------------------------
+        # 10-3. 모델이 Tool을 요청하지 않은 경우
+        # -----------------------------------------
+
+        if not requested:
+
+            answer = (
+                msg.get("content") or ""
+            ).strip()
+
+            return ChatResponse(
+                answer=answer,
+                tool_calls=[],
+                model=MODEL,
+                elapsed_ms=int(
+                    (time.monotonic() - start) * 1000
+                )
+            )
+
+        # -----------------------------------------
+        # 10-4. Tool 호출 요청을 대화 기록에 저장
+        # -----------------------------------------
+
+        # 이 부분이 기존 코드에서 누락되었던 부분이다.
+        #
+        # Gemma가 도구를 호출한 사실을 저장해야
+        # 다음 응답에서 Tool 결과를 이해할 수 있다.
+
+        messages.append({
+            "role": "assistant",
+            "content": msg.get("content") or "",
+            "tool_calls": requested
+        })
+
+        # -----------------------------------------
+        # 10-5. Gemma가 선택한 Tool 실행
+        # -----------------------------------------
+
+        # 여러 Tool을 요청했다면 순서대로 처리한다.
+        # 다만 동일한 Tool을 반복 요청했을 때
+        # 불필요한 DB 조회가 발생하지 않도록 한다.
+
+        executed_names = set()
+
+        for tc in requested:
+
+            fn = tc.get("function") or {}
+
+            name = fn.get("name")
+
+            # Tool 이름이 없으면 실행하지 않는다.
+            if not isinstance(name, str) or not name:
+                raise HTTPException(
+                    status_code=502,
+                    detail="모델이 잘못된 Tool 호출을 생성했습니다."
                 )
 
-            # 모델의 툴 요청을 대화에 남기고, 실행 결과를 tool 메시지로 돌려준다.
-            # Ollama가 돌려주는 요청의 모양 (실제 응답은 print(requested)로 확인):
-            #   requested = [{"function": {"name": "get_patient_record",
-            #                              "arguments": {"member_id": 1}}}]          
-            for tc in requested:
-                fn = tc["function"]
-                name = fn["name"]
-                result = run_tool(name, req.member_id)
-                calls.append({
+            # 동일한 도구가 한 번의 응답에서
+            # 중복 요청되면 기존 결과를 재사용한다.
+            if name in executed_names:
+                result = next(
+                    item["result"]
+                    for item in executed_results
+                    if item["name"] == name
+                )
+            else:
+                result = run_tool(
+                    name=name,
+                    member_id=req.member_id
+                )
+
+                executed_names.add(name)
+
+                # 처음 실행한 결과만 저장한다.
+                if "executed_results" not in locals():
+                    executed_results = []
+
+                executed_results.append({
                     "name": name,
-                    "model_arguments": fn.get("arguments") or {},
-                    "used_member_id": req.member_id,
-                    "status": result.get("status"),
-                })
-                messages.append({
-                    "role": "tool",
-                    "tool_name": name,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "result": result
                 })
 
-    raise HTTPException(502, "툴 호출이 너무 많이 반복되어 중단함")
+            # 개인정보는 출력하지 않고
+            # 도구명 및 결과 상태만 로그에 남긴다.
+            logger.info(
+                "Tool executed: %s, status=%s",
+                name,
+                result.get("status", "unknown")
+            )
+
+            # 실제 Tool 실행 이력
+            calls.append({
+                "name": name,
+                "model_arguments": fn.get("arguments") or {},
+                "used_member_id": req.member_id,
+                "status": result.get("status")
+            })
+
+            # Ollama Tool 응답 형식으로 추가
+            messages.append({
+                "role": "tool",
+                "tool_name": name,
+                "content": json.dumps(
+                    result,
+                    ensure_ascii=False,
+                    default=str
+                )
+            })
+
+        # -----------------------------------------
+        # 10-6. Gemma에 최종 답변 생성 요청
+        # -----------------------------------------
+
+        # 앞선 단계에서 필요한 정보를 조회했으므로
+        # 이번 요청에는 Tool 목록을 전달하지 않는다.
+        #
+        # 이를 통해 모델이 같은 Tool을 반복 호출하는
+        # 문제를 방지한다.
+        #
+        # 주의:
+        # 이는 단일 Tool 호출 중심의 MVP 설계이며,
+        # 여러 단계의 연쇄 Tool Calling은 추후 구현한다.
+
+        final_msg = call_ollama(
+            client=client,
+            messages=messages,
+            enable_tools=False
+        )
+
+        # -----------------------------------------
+        # 10-7. 최종 답변 검증
+        # -----------------------------------------
+
+        answer = (
+            final_msg.get("content") or ""
+        ).strip()
+
+        # Ollama가 최종 단계에서도 Tool을 요청하거나
+        # 빈 응답을 반환하면 정상 완료로 처리하지 않는다.
+        if final_msg.get("tool_calls") or not answer:
+            raise HTTPException(
+                status_code=502,
+                detail="Gemma가 최종 답변을 생성하지 못했습니다."
+            )
+
+        # -----------------------------------------
+        # 10-8. 최종 응답 반환
+        # -----------------------------------------
+
+        return ChatResponse(
+            answer=answer,
+            tool_calls=calls,
+            model=MODEL,
+            elapsed_ms=int(
+                (time.monotonic() - start) * 1000
+            )
+        )
